@@ -32,9 +32,24 @@ def _next_backoff(current: float) -> float:
 
 
 async def async_worker(stop_event: Optional[asyncio.Event] = None):
-    if not AsyncTaskQueue.get_instance():
+    app = AsyncTaskQueue.get_instance()
+    if not app:
         raise RuntimeError('AsyncTaskQueue is not initialized')
-    raise NotImplementedError('wired up in Task 7')  # ponytail: temporary, mid-branch only
+
+    r = app.redis_builder.get_redis_async()
+    worker = Worker(
+        r, app.distribute_qname, app.get_concurrency(), app.logger,
+        status_ttl=app.status_ttl,
+        heartbeat_interval=app.heartbeat_interval,
+        heartbeat_ttl=app.heartbeat_ttl,
+        shutdown_timeout=app.shutdown_timeout,
+    )
+    if stop_event is None:
+        stop_event = asyncio.Event()
+    try:
+        await worker.run(stop_event)
+    finally:
+        await r.close()
 
 
 class Worker:
@@ -250,3 +265,50 @@ class Worker:
             except Exception as e:
                 self.logger.warning('%s failed: %r', name, e)
             await asyncio.sleep(interval)
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        await self.migrate_legacy(startup=True)
+        await self.beat()
+        loops = [
+            asyncio.create_task(self._every(
+                self.heartbeat_interval, self.beat,
+                "heartbeat (peers may reclaim this worker's tasks if Redis stays unreachable)")),
+            asyncio.create_task(self._every(self.heartbeat_interval, self.reap, 'reaper')),
+            asyncio.create_task(self._every(1, self.promote, 'retry promoter')),
+        ]
+        fetch = asyncio.create_task(self.fetch_loop())
+        stop_wait = asyncio.create_task(stop_event.wait())
+        self.logger.info('worker %s listening on %s', self.wid, self.main_key)
+        try:
+            await asyncio.wait({fetch, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (fetch, stop_wait):
+                t.cancel()
+            for r in await asyncio.gather(fetch, stop_wait, return_exceptions=True):
+                if isinstance(r, Exception):
+                    self.logger.error('fetch loop crashed: %r', r)
+            await self.drain()
+            for t in loops:
+                t.cancel()
+            await asyncio.gather(*loops, return_exceptions=True)
+            try:
+                n = await scripts.release(self.redis, self.q, self.wid)
+                if n:
+                    self.logger.info('requeued %d unstarted task(s) on exit', n)
+            except Exception as e:
+                self.logger.error('release failed (%r); peers will reclaim after heartbeat expiry', e)
+            self.logger.info('worker %s stopped', self.wid)
+
+    async def drain(self) -> None:
+        """Let running tasks finish (up to shutdown_timeout), cancel the rest, flush acks."""
+        if self.inflight:
+            self.logger.info('waiting up to %ss for %d running task(s)', self.shutdown_timeout, len(self.inflight))
+            _, pending = await asyncio.wait(set(self.inflight), timeout=self.shutdown_timeout)
+            for t in pending:
+                t.cancel()
+            if pending:
+                # ponytail: a task that swallows cancellation gets one more shutdown_timeout, then is abandoned
+                await asyncio.wait(pending, timeout=self.shutdown_timeout)
+        await asyncio.sleep(0)  # let done-callbacks schedule their ack tasks
+        if self.background:
+            await asyncio.gather(*set(self.background), return_exceptions=True)
