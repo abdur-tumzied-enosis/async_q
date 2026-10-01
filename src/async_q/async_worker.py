@@ -4,7 +4,7 @@ import copy
 import time
 from typing import Optional
 
-from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
+from redis.exceptions import RedisError
 
 from .async_q import AsyncTaskQueue
 from .utils import (
@@ -147,17 +147,28 @@ class Worker:
     async def fetch_loop(self) -> None:
         """Pull work only when a concurrency slot is free. Runs until cancelled."""
         backoff = 1.0
+        fetched = None  # payload moved to our backup but not yet turned into an item
         while True:
             await self.sem.acquire()
             try:
-                value = await self.redis.brpoplpush(self.main_key, self.backup_key, timeout=1)
-                item = await self.process_message(value) if value is not None else None
-            except (RedisConnectionError, RedisTimeoutError) as e:
-                # ponytail: a payload fetched just before the error stays in our backup until release()
+                fetched = await self.redis.brpoplpush(self.main_key, self.backup_key, timeout=1)
+                item = await self.process_message(fetched) if fetched is not None else None
+                fetched = None
+            except RedisError as e:
                 self.sem.release()
                 self.logger.warning('redis unavailable (%r); retrying in %.0fs', e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = _next_backoff(backoff)
+                while fetched is not None:
+                    # Best effort: hand the stranded payload back to main. If the reply was lost
+                    # after the server already moved it, it stays in backup until release() at shutdown.
+                    try:
+                        if await self.redis.lrem(self.backup_key, 1, fetched):
+                            await self.redis.rpush(self.main_key, fetched)
+                        fetched = None
+                    except RedisError:
+                        await asyncio.sleep(backoff)
+                        backoff = _next_backoff(backoff)
                 continue
             except BaseException:
                 self.sem.release()

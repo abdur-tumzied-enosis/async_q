@@ -109,3 +109,52 @@ async def test_inflight_tracks_running_tasks(tmp_path):
     assert w.redis.lists[w.backup_key] == []
     loop_task.cancel()
     await asyncio.gather(loop_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_payload_returned_to_main_after_post_fetch_redis_error(tmp_path):
+    path = _module(tmp_path, "ran = []\nasync def job(task_id=None):\n    ran.append(1)\n")
+    redis = FakeAsyncRedis()
+    real_set = redis.set
+    calls = {"n": 0}
+
+    async def flaky_set(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RedisConnectionError("down")
+        return await real_set(*a, **kw)
+
+    redis.set = flaky_set
+    w = Worker(redis, Q, 2, NoopLogger(), wid="w1")
+    await redis.lpush(w.main_key, _payload(path, "ok"))
+    loop_task = asyncio.create_task(w.fetch_loop())
+    jobs = get_function_ref(path, "job").__globals__
+    assert await _until(lambda: jobs["ran"] == [1], timeout=3.0)
+    assert await _until(lambda: redis.lists[w.backup_key] == [])
+    loop_task.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_fetch_loop_survives_cluster_down_error(tmp_path):
+    from redis.exceptions import ClusterDownError
+    path = _module(tmp_path, "ran = []\nasync def job(task_id=None):\n    ran.append(1)\n")
+    redis = FakeAsyncRedis()
+    real = redis.brpoplpush
+    calls = {"n": 0}
+
+    async def flaky(src, dst, timeout=0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ClusterDownError("CLUSTERDOWN")
+        return await real(src, dst, timeout)
+
+    redis.brpoplpush = flaky
+    w = Worker(redis, Q, 2, NoopLogger(), wid="w1")
+    await redis.lpush(w.main_key, _payload(path, "ok"))
+    loop_task = asyncio.create_task(w.fetch_loop())
+    jobs = get_function_ref(path, "job").__globals__
+    assert await _until(lambda: jobs["ran"] == [1], timeout=3.0)
+    assert not loop_task.done()
+    loop_task.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
