@@ -23,6 +23,7 @@ from .utils import (
     get_heartbeat_key,
     get_workers_key,
     new_worker_id,
+    get_legacy_keys,
 )
 
 
@@ -189,3 +190,63 @@ class Worker:
         bg = asyncio.create_task(self.task_done(task, item))
         self.background.add(bg)
         bg.add_done_callback(self.background.discard)
+
+    async def beat(self) -> None:
+        await self.redis.set(self.hb_key, str(time.time()), px=int(self.heartbeat_ttl * 1000))
+        # Re-register every beat: a worker wrongly reaped during a network blip comes back.
+        await self.redis.sadd(self.workers_key, self.wid)
+
+    async def reap(self) -> None:
+        for member in await self.redis.smembers(self.workers_key):
+            wid = member.decode() if isinstance(member, bytes) else member
+            if wid == self.wid:
+                continue
+            n = await scripts.reclaim(self.redis, self.q, wid)
+            if n > 0:
+                self.logger.warning('reclaimed %d task(s) from dead worker %s', n, wid)
+            elif n == 0:
+                self.logger.info('removed dead worker %s', wid)
+        await self.migrate_legacy(startup=False)
+
+    async def promote(self) -> None:
+        n = await scripts.promote_due(self.redis, self.q, time.time())
+        if n:
+            self.logger.debug('promoted %d due retr(y/ies)', n)
+
+    async def migrate_legacy(self, startup: bool) -> int:
+        """Move pre-0.3.0 keys into hash-tagged keys. Per item, not atomic across slots.
+        # ponytail: delete one release after 0.3.0
+        """
+        old = get_legacy_keys(self.q)
+        pairs = [(old['main'], self.main_key)]
+        if startup:
+            pairs += [(old['backup'], self.main_key), (old['dead'], self.dead_key)]
+        moved = 0
+        for src, dst in pairs:
+            while True:
+                v = await self.redis.rpop(src)
+                if v is None:
+                    break
+                await self.redis.lpush(dst, v)
+                moved += 1
+                if src == old['backup']:
+                    self.logger.warning('requeued legacy in-flight task; assumes no pre-0.3 workers are running')
+        while True:
+            items = await self.redis.zrange(old['retry'], 0, 99, withscores=True)
+            if not items:
+                break
+            for v, score in items:
+                await self.redis.zadd(self.retry_key, {v: score})  # add before remove: crash duplicates, never loses
+                await self.redis.zrem(old['retry'], v)
+                moved += 1
+        if moved:
+            self.logger.info('migrated %d item(s) from legacy keys', moved)
+        return moved
+
+    async def _every(self, interval: float, fn, name: str) -> None:
+        while True:
+            try:
+                await fn()
+            except Exception as e:
+                self.logger.warning('%s failed: %r', name, e)
+            await asyncio.sleep(interval)
