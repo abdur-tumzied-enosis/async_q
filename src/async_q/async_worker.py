@@ -86,12 +86,13 @@ async def _task_done(task: asyncio.Task, queue: AsyncQueue, distribute_qname: st
             score = time.time() + delay
             meta.next_retry_at = score
             await redis.set(get_task_key(meta.id), serialize(meta))
-            await redis.zadd(get_retry_zset_key(distribute_qname), {item.original_data: score})
+            # Re-serialize so the bumped attempt count travels with the payload
+            await redis.zadd(get_retry_zset_key(distribute_qname), {serialize(meta): score})
             logger.info('scheduled retry #%s in %.2fs for %s', meta.attempt, delay, meta.id)
         else:
             # Send to DLQ
             await redis.set(get_task_key(meta.id), serialize(meta))
-            await redis.lpush(get_dead_letter_key(distribute_qname), item.original_data)
+            await redis.lpush(get_dead_letter_key(distribute_qname), serialize(meta))
             logger.warning('moved task %s to DLQ after %s attempts', meta.id, meta.attempt)
     finally:
         queue.task_done()

@@ -9,6 +9,7 @@ from async_q.utils import (
     TaskMetaData,
     QueueItem,
     serialize,
+    deserialize,
     get_redis_q_key,
     get_redis_q_backup_key,
     get_task_key,
@@ -54,7 +55,8 @@ async def test_task_done_schedules_retry_when_under_limit():
 
     # Should be scheduled for retry
     assert retry_key in redis.zsets
-    assert payload in redis.zsets[retry_key]
+    (scheduled,) = redis.zsets[retry_key]
+    assert deserialize(scheduled).attempt == 1
     # removed from backup
     assert payload not in redis.lists.get(backup_key, [])
 
@@ -90,7 +92,7 @@ async def test_task_done_moves_to_dlq_when_exhausted():
 
     # Should be in DLQ
     assert dlq_key in redis.lists
-    assert redis.lists[dlq_key][0] == payload
+    assert deserialize(redis.lists[dlq_key][0]).id == 'tid2'
     # removed from backup
     assert payload not in redis.lists.get(backup_key, [])
 
@@ -112,3 +114,36 @@ async def test_task_done_callback_holds_reference_until_done():
     await asyncio.gather(*aw._background_tasks)
     await asyncio.sleep(0)  # let discard callback run
     assert len(aw._background_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_failing_task_reaches_dlq_after_max_retries():
+    from async_q.utils import deserialize
+    redis = FakeAsyncRedis()
+    qname = 'default'
+    retry_key = get_retry_zset_key(qname)
+    dlq_key = get_dead_letter_key(qname)
+    meta = TaskMetaData(id='t4', path='/x.py', func_name='f', args=[], kwargs={},
+                        status='submitted', max_retries=2, backoff_base=1.0, backoff_factor=2.0)
+    payload = serialize(meta)
+
+    class DummyQ:
+        def task_done(self):
+            pass
+
+    delays = []
+    for _ in range(meta.max_retries + 1):
+        await redis.lpush(get_redis_q_backup_key(qname), payload)  # picked up by worker
+        item = QueueItem(func_ref=None, deserialize_data=deserialize(payload), original_data=payload)
+        before = time.time()
+        await _task_done(FakeTask(exc=RuntimeError('boom')), DummyQ(), qname, redis, NoopLogger(), item)
+        due = redis.zsets.get(retry_key, {})
+        if not due:
+            break
+        (payload, score), = due.items()  # promote the retry entry
+        delays.append(round(score - before))
+        del redis.zsets[retry_key][payload]
+
+    assert delays == [1, 2]
+    assert len(redis.lists[dlq_key]) == 1
+    assert deserialize(redis.lists[dlq_key][0]).attempt == 2
