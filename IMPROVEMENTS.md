@@ -30,6 +30,8 @@ Found in Batch 1 review (deferred):
 - [x] **B6 — Shutdown doesn't drain in-flight tasks.** Backup is requeued while tasks still run (duplicates); `r.close()` races done-callbacks. Fix: track in-flight tasks, `gather` with timeout, then requeue + close.
 - [x] **B10 — Status keys leak.** Only `finished` gets a TTL; `starting`, `failed`, DLQ statuses never expire. Fix: TTL on every status write (configurable).
 - [ ] **B11 — Remove legacy (pre-0.3.0) key drain** (`get_legacy_keys`, `Worker.migrate_legacy`) one release after 0.3.0.
+- [ ] **B12 — Orphan window after a wrong reap.** A worker reaped during an outage that fetches before its next `beat()` and is then hard-killed leaves its backup unregistered forever. Fix: re-`SADD` in fetch error recovery, or have the reaper scan `async_task_backup:{q}:*` keys.
+- [ ] **B13 — CLI exits 0 on fatal errors.** The process exits 0 when the fetch loop crashes or Redis is down at startup, so supervisors that restart only on failure won't restart it. Fix: non-zero exit code.
 
 ## Design / security
 

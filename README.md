@@ -132,12 +132,12 @@ $ python my_task.py
 
 ### Running multiple workers
 
-Run as many worker processes per queue as you like (containers, pods, terminals). Each worker keeps its in-flight tasks in its own Redis list and refreshes a heartbeat every 10s. If a worker dies, a peer moves its in-flight tasks back to the queue within ~40s.
+Run as many worker processes per queue as you like (containers, pods, terminals). Each worker keeps its in-flight tasks in its own Redis list and refreshes a heartbeat every 10s by default (`heartbeat_interval`). If a worker dies, a peer moves its in-flight tasks back to the queue within ~40s with the defaults (`heartbeat_ttl` 30s plus one reaper pass).
 
 - **Delivery is at-least-once.** A task can run twice if its worker dies mid-task or loses Redis for longer than the heartbeat TTL. Make tasks idempotent.
-- **Long tasks are fine.** Liveness is per worker, not per task, so a 2-hour task on a healthy worker is never taken away.
+- **Long tasks are fine.** Liveness is per worker, not per task, so a 2-hour task on a healthy worker is never taken away — as long as it doesn't block the event loop. Synchronous CPU work or `time.sleep` stops the heartbeat, and peers will reclaim (and re-run) that worker's tasks; run blocking code in a thread or process.
 - **Graceful shutdown.** On SIGTERM/Ctrl+C a worker stops fetching, waits up to `--shutdown-timeout` seconds (default 30) for running tasks, then re-queues the rest. Raise it for long tasks, and set your orchestrator's grace period (e.g. Kubernetes `terminationGracePeriodSeconds`) a bit higher.
-- **Redis Cluster.** Use `RedisBuilder(host=..., port=..., cluster=True)`. Every key of a queue shares one hash slot (`async_task:{<queue>}` …).
+- **Redis Cluster.** Use `RedisBuilder(host=..., port=..., cluster=True)`. Every queue/worker key of a queue shares one hash slot (`async_task:{<queue>}` …).
 - **Tuning.** `AsyncTaskQueue(redis_builder, status_ttl=86400, heartbeat_interval=10, heartbeat_ttl=30, shutdown_timeout=30)`.
 
 **Upgrading from 0.2.x:** key names changed. New workers move tasks from the old keys automatically, and keep draining the old queue key for producers that are still on 0.2.x. Stop all 0.2.x **workers** before starting 0.3 workers.

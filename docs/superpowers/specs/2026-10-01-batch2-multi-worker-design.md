@@ -46,10 +46,13 @@ Legacy (pre-0.3.0) keys: `async_task:<q>`, `async_task_backup:<q>`, `async_task_
 ## Atomic operations
 
 - **Fetch:** `BRPOPLPUSH async_task:{q} async_task_backup:{q}:<wid> timeout=1`.
-- **Ack (success / failure / cancel):** `LREM async_task_backup:{q}:<wid> 1 <payload>` on the worker's own list, then existing Batch 1 logic (status, retry ZSET, DLQ, requeue).
+- **Ack (success):** `LREM async_task_backup:{q}:<wid> 1 <payload>` on the worker's own list (a single atomic command), then status. Failure, reject and cancel acks use the `fail_ack` / `requeue` scripts below so a crash between steps never leaves the payload in no list; status is written only after the script, and only if it removed the payload.
+- **In-flight copies:** if peers reclaimed this worker's backup during an outage and it re-fetches the same bytes, two in-flight copies share one backup entry. The worker counts in-flight copies per payload; every copy but the last skips its ack/retry/DLQ (logs a warning, frees its slot) and the last one acks normally.
 - **Lua `reclaim`** — KEYS: hb, backup, main, registry; ARGV: wid. If `EXISTS hb` → return 0. Else `RPOPLPUSH backup main` until empty, `DEL backup`, `SREM registry wid`, return count moved. Idempotent; concurrent reapers are harmless.
-- **Lua `promote_due`** — KEYS: retry zset, main; ARGV: now, limit (100). `ZRANGEBYSCORE retry -inf now LIMIT 0 limit`, `ZREM` each, `LPUSH main` each, return count. No double promotion.
+- **Lua `promote_due`** — KEYS: retry zset, main; ARGV: now, limit (100). `ZRANGEBYSCORE retry -inf now LIMIT 0 limit`, `ZREM` each, `RPUSH main` each (the consuming end, so due retries run next), return count. No double promotion.
 - **Lua `release`** — KEYS: backup, main, hb, registry; ARGV: wid. Move all of backup to main, `DEL backup`, `DEL hb`, `SREM registry wid`.
+- **Lua `requeue`** — KEYS: backup, main; ARGV: payload. `LREM backup 1 payload`; only if removed, `RPUSH main payload` (front of the queue). Returns removed count. Used for cancelled tasks and for a payload stranded by a Redis error right after fetch; idempotent.
+- **Lua `fail_ack`** — KEYS: backup, retry zset, dead; ARGV: original, new_payload, score, mode (`retry` | `dead`). `LREM backup 1 original`; only if removed: `retry` → `ZADD retry score new_payload`, `dead` → `LPUSH dead new_payload`. Returns removed count (0 = a peer reclaimed it; nothing written). Used for failed tasks (new_payload carries the bumped attempt) and rejected payloads (new_payload = original).
 
 ## Worker lifecycle
 
@@ -78,7 +81,7 @@ A payload leaves main only when a slot is free, so a worker never hoards un-star
 
 ### Shutdown (SIGTERM, SIGINT, or `stop_event`)
 
-1. Stop fetching (a payload returned by the in-progress 1s fetch still runs).
+1. Stop fetching: the in-progress 1s fetch is cancelled; a payload it already moved to the backup is not run and is requeued by `release` (step 6).
 2. `asyncio.wait(inflight, timeout=shutdown_timeout)`.
 3. Cancel remaining in-flight tasks; their done-handlers requeue them (existing `CancelledError` path).
 4. Await all `_background_tasks`.
@@ -111,7 +114,7 @@ Every write to `async-q-task:<id>` uses `ex=status_ttl` (submitted, pending, sta
 ## Error handling
 
 - Heartbeat / reaper / promoter loops: catch, log, continue each iteration. Heartbeat failures log a warning noting peers may reclaim this worker's tasks after `heartbeat_ttl`.
-- Fetch loop: on `redis.ConnectionError` / `TimeoutError`, log and retry with backoff 1s → 2s → … capped at 30s; reset on success. Never exits the worker.
+- Fetch loop: on any `redis.RedisError` (connection, timeout, cluster-down, …), log and retry with backoff 1s → 2s → … capped at 30s; reset on success. Never exits the worker.
 - Late ack after being reaped: `LREM` returns 0; log a warning (task may have run twice).
 
 ## Testing
