@@ -34,7 +34,7 @@ Found in Batch 1 review (deferred):
 
 - [ ] **D1 — Payload carries an absolute file path that the worker `exec`s.** Redis write access = RCE on workers; also breaks when producer and worker paths differ (Docker). Fix: `module:qualname` + `importlib.import_module`, ideally a `@task` registry.
 - [ ] **D2 — `task_id` forced into kwargs.** Tasks without `task_id` param / `**kwargs` fail with `TypeError`. Fix: pass only if signature accepts it, or document.
-- [ ] **D3 — `AsyncQueue` scans `asyncio.all_tasks()` with regex per `put` and pokes private `_putters`.** Fix: `asyncio.Semaphore(concurrency)`, delete class.
+- [x] **D3 — `AsyncQueue` scans `asyncio.all_tasks()` with regex per `put` and pokes private `_putters`.** Fix: `asyncio.Semaphore(concurrency)`, delete class.
 - [ ] **D4 — No async submit.** `submit_task` blocks async views. Fix: `asubmit_task` using the async client.
 
 ## Cleanup / DX
