@@ -201,7 +201,7 @@ async def listen_to_submitted_task(distribute_qname: str, redis: aioredis.Redis,
 
 async def async_worker(stop_event: Optional[asyncio.Event] = None):
     if not AsyncTaskQueue.get_instance():
-        Exception('AsyncTaskQueue did not initiated')
+        raise RuntimeError('AsyncTaskQueue is not initialized')
 
     async_task_q = AsyncTaskQueue.get_instance()
     r = async_task_q.redis_builder.get_redis_async()

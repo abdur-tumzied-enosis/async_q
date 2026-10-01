@@ -10,7 +10,7 @@ Plan: [`docs/superpowers/plans/2026-10-01-quick-fixes.md`](docs/superpowers/plan
 
 - [x] **B4 — Task module re-executed on every task.** `utils.get_function_ref` runs `exec_module` per call: slow, resets module state, leaks memory. Fix: `functools.lru_cache`. Note: workers now need a restart to pick up task code changes.
 - [x] **B3 — Poison message kills the worker.** Bad payload or unloadable function raises out of the producer loop (`async_worker.listen_to_submitted_task`); item stays in backup and crashes again on restart. Also dead `isinstance` branch + `assert` that `-O` strips. Fix: reject to DLQ and continue.
-- [ ] **B8 — `async_worker` builds but never raises "not initiated" exception.** Fix: `raise RuntimeError`.
+- [x] **B8 — `async_worker` builds but never raises "not initiated" exception.** Fix: `raise RuntimeError`.
 - [ ] **B2 — Retries unreachable from public API.** `submit_task` has no `max_retries` / `backoff_*` params. Fix: add them.
 - [ ] **B7 — Fire-and-forget done-handler tasks may be GC'd.** `task_done_callback` drops the `create_task` reference. Fix: hold in a module-level set.
 - [ ] **B9 — CLI uses deprecated `asyncio.get_event_loop()`.** Fix: `main()` with `asyncio.new_event_loop()`, plus `async_q` console script.
