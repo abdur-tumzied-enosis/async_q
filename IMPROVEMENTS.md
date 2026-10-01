@@ -15,6 +15,14 @@ Plan: [`docs/superpowers/plans/2026-10-01-quick-fixes.md`](docs/superpowers/plan
 - [x] **B7 — Fire-and-forget done-handler tasks may be GC'd.** `task_done_callback` drops the `create_task` reference. Fix: hold in a module-level set.
 - [x] **B9 — CLI uses deprecated `asyncio.get_event_loop()`.** Fix: `main()` with `asyncio.new_event_loop()`, plus `async_q` console script.
 
+Found in Batch 1 review (deferred):
+- [ ] **F1 — Payload with wrong field types (e.g. int `id`) still crashes the producer.** Only from foreign/buggy producers. Fix: type-check `id`/`path`/`func_name` in the deserialize `try`.
+- [ ] **F2 — Shared task module executed once per function.** Cache key is `(path, func_name)`; `task_a` and `task_b` in one file get separate module state. Fix: cache a path-keyed module loader.
+- [ ] **F3 — README doesn't say workers must restart to pick up task code changes** (consequence of B4).
+- [ ] **F4 — `main()` leaves a closed loop as current.** Add `asyncio.set_event_loop(None)` after `loop.close()`.
+- [ ] **F5 — `backoff_*` params not validated** (negative values → immediate retry).
+- [ ] **F6 — DLQ entries don't record why they failed.** Add an `error` field.
+
 ## Batch 2 — multi-worker correctness
 
 - [ ] **B1 — Multiple workers on one queue re-run each other's tasks.** Backup list is shared; startup (`listen_to_submitted_task`) and shutdown (`async_worker` finally) move the *whole* backup list back to main. Fix: per-worker backup key + heartbeat/reclaim of dead workers' backups.
