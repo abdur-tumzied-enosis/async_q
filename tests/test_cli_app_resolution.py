@@ -98,6 +98,23 @@ def test_main_shutdown_timeout_flag(tmp_path, monkeypatch, reset_async_task_queu
     assert cli.AsyncTaskQueue.get_instance().shutdown_timeout == 600
 
 
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "abc"])
+def test_main_rejects_non_positive_shutdown_timeout(tmp_path, monkeypatch, reset_async_task_queue, value):
+    from async_q import __main__ as cli
+
+    async def fake_worker(stop_event=None):
+        pass
+
+    async def fake_close():
+        pass
+
+    monkeypatch.setattr(cli, "async_worker", fake_worker)
+    monkeypatch.setattr(cli, "close", fake_close)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-a", f"{_app_file(tmp_path)}:app", "--shutdown-timeout", value])
+    assert exc.value.code == 2  # argparse usage error
+
+
 def test_main_falls_back_to_signal_signal_when_loop_lacks_handlers(tmp_path, monkeypatch, reset_async_task_queue):
     from async_q import __main__ as cli
     installed = {}

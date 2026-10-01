@@ -39,6 +39,16 @@ def resolve_app(app_spec: str) -> AsyncTaskQueue:
     return async_task_queue
 
 
+def _positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{text!r} is not a number')
+    if not (value > 0):  # also rejects nan
+        raise argparse.ArgumentTypeError(f'must be > 0, got {text!r}')
+    return value
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Async task queue worker")
     parser.add_argument(
@@ -64,7 +74,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument('-lf', '--log_filename', default=None, type=str,
                         required=False,
                         help='set log file path `-lf ./logs/async-q.log`')
-    parser.add_argument('--shutdown-timeout', default=None, type=float,
+    parser.add_argument('--shutdown-timeout', default=None, type=_positive_seconds,
                         help='seconds to let running tasks finish on shutdown before re-queueing them (default 30)')
 
     args = parser.parse_args(argv)
