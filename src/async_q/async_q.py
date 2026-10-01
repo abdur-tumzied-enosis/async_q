@@ -15,7 +15,8 @@ class RedisBuilder:
     __redis_sync = None
     __redis_async = None
 
-    def __init__(self, host: str = 'localhost', port: int = 6379, username: Optional[str] = None, password: Optional[str] = None, **kwargs):
+    def __init__(self, host: str = 'localhost', port: int = 6379, username: Optional[str] = None, password: Optional[str] = None, cluster: bool = False, **kwargs):
+        self.cluster = cluster
         self.kwargs = {
             'host': host,
             'port': port,
@@ -26,12 +27,14 @@ class RedisBuilder:
 
     def get_redis(self) -> redis.Redis:
         if not self.__redis_sync:
-            self.__redis_sync = redis.Redis(**self.kwargs)
+            cls = redis.RedisCluster if self.cluster else redis.Redis
+            self.__redis_sync = cls(**self.kwargs)
         return self.__redis_sync
 
     def get_redis_async(self) -> aioredis.Redis:
         if not self.__redis_async:
-            self.__redis_async = aioredis.Redis(**self.kwargs)
+            cls = aioredis.RedisCluster if self.cluster else aioredis.Redis
+            self.__redis_async = cls(**self.kwargs)
         return self.__redis_async
 
 
@@ -40,11 +43,30 @@ class AsyncTaskQueue:
 
     _instance: Optional["AsyncTaskQueue"] = None
 
-    def __init__(self, redis_builder: RedisBuilder):
+    def __init__(
+        self,
+        redis_builder: RedisBuilder,
+        *,
+        status_ttl: int = 86400,
+        heartbeat_interval: float = 10.0,
+        heartbeat_ttl: float = 30.0,
+        shutdown_timeout: float = 30.0,
+    ):
+        for name, value in (('status_ttl', status_ttl), ('heartbeat_interval', heartbeat_interval),
+                            ('heartbeat_ttl', heartbeat_ttl), ('shutdown_timeout', shutdown_timeout)):
+            if value <= 0:
+                raise ValueError('{} must be > 0'.format(name))
+        if heartbeat_ttl < 2 * heartbeat_interval:
+            raise ValueError('heartbeat_ttl must be at least 2 * heartbeat_interval')
+
         self.distribute_qname = 'default'
         self.redis_builder = redis_builder
         self._concurrency = 100
         self.logger = logging.getLogger('async-q')
+        self.status_ttl = status_ttl
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_ttl = heartbeat_ttl
+        self.shutdown_timeout = shutdown_timeout
 
         if not AsyncTaskQueue._instance:
             AsyncTaskQueue._instance = self 
