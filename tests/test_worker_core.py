@@ -226,3 +226,29 @@ async def _until(pred, timeout=2.0):
             return True
         await asyncio.sleep(0.01)
     return False
+
+
+class RecordingLogger(NoopLogger):
+    def __init__(self):
+        self.errors = []
+
+    def error(self, msg, *a, **k):
+        self.errors.append(a)
+
+
+@pytest.mark.asyncio
+async def test_ack_failure_is_logged(monkeypatch):
+    async def broken_lrem(*a, **k):
+        raise RedisConnectionError("ack lost")
+
+    async def job(task_id=None):
+        pass
+
+    log = RecordingLogger()
+    w = Worker(FakeAsyncRedis(), Q, 1, log, wid="w1")
+    w.redis.lrem = broken_lrem
+    await w.sem.acquire()
+    w.start_task(QueueItem(func_ref=job, deserialize_data=_meta(), original_data=b"p"))
+    assert await _until(lambda: not w.inflight and not w.background)
+    await asyncio.sleep(0)
+    assert any(isinstance(arg, RedisConnectionError) for args in log.errors for arg in args)

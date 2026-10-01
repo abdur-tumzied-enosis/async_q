@@ -221,6 +221,11 @@ class Worker:
         bg = asyncio.create_task(self.task_done(task, item))
         self.background.add(bg)
         bg.add_done_callback(self.background.discard)
+        bg.add_done_callback(lambda t, _id=item.deserialize_data.id: self._log_ack_error(t, _id))
+
+    def _log_ack_error(self, bg, task_id) -> None:
+        if not bg.cancelled() and bg.exception() is not None:
+            self.logger.error('finishing task %s failed: %r', task_id, bg.exception())
 
     async def beat(self) -> None:
         await self.redis.set(self.hb_key, str(time.time()), px=int(self.heartbeat_ttl * 1000))
