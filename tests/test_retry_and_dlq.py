@@ -93,3 +93,22 @@ async def test_task_done_moves_to_dlq_when_exhausted():
     assert redis.lists[dlq_key][0] == payload
     # removed from backup
     assert payload not in redis.lists.get(backup_key, [])
+
+
+@pytest.mark.asyncio
+async def test_task_done_callback_holds_reference_until_done():
+    from async_q import async_worker as aw
+    redis = FakeAsyncRedis()
+    meta = TaskMetaData(id='t3', path='/x.py', func_name='f', args=[], kwargs={}, status='starting')
+    payload = serialize(meta)
+    item = QueueItem(func_ref=None, deserialize_data=meta, original_data=payload)
+
+    class DummyQ:
+        def task_done(self):
+            pass
+
+    aw.task_done_callback(FakeTask(result=item), DummyQ(), 'default', redis, NoopLogger(), item)
+    assert len(aw._background_tasks) == 1
+    await asyncio.gather(*aw._background_tasks)
+    await asyncio.sleep(0)  # let discard callback run
+    assert len(aw._background_tasks) == 0

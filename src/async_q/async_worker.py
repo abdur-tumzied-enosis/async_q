@@ -96,8 +96,14 @@ async def _task_done(task: asyncio.Task, queue: AsyncQueue, distribute_qname: st
     finally:
         queue.task_done()
 
+# Strong refs so the event loop can't GC done-handlers mid-flight
+_background_tasks: set = set()
+
+
 def task_done_callback(task, queue: AsyncQueue, distribute_qname: str, redis: aioredis.Redis, logger, item: QueueItem):
-    asyncio.create_task(_task_done(task, queue, distribute_qname, redis, logger, item))
+    t = asyncio.create_task(_task_done(task, queue, distribute_qname, redis, logger, item))
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
 
 
 async def _task_inner(tkey, func, item: QueueItem, redis, logger):
