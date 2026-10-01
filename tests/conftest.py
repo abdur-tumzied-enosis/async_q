@@ -3,6 +3,7 @@ import sys
 import asyncio
 
 import pytest
+import pytest_asyncio
 
 # Ensure `src` is on sys.path before tests import modules
 _project_root = os.path.dirname(os.path.dirname(__file__))
@@ -28,3 +29,14 @@ def event_loop():
     loop.close()
 
 
+@pytest_asyncio.fixture
+async def real_redis():
+    url = os.getenv("ASYNC_Q_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("set ASYNC_Q_TEST_REDIS_URL to run Redis integration tests")
+    import redis.asyncio as aioredis
+    r = aioredis.Redis.from_url(url)
+    await r.flushdb()
+    yield r
+    await r.flushdb()
+    await r.close()
