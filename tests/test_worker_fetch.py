@@ -3,9 +3,11 @@ import asyncio
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from fakes import FakeAsyncRedis, NoopLogger
+from fakes import FakeAsyncRedis, NoopLogger, fake_requeue
 from async_q.async_worker import Worker, _next_backoff
-from async_q.utils import TaskMetaData, serialize, get_function_ref, get_redis_q_key, get_redis_q_backup_key
+from async_q.utils import TaskMetaData, serialize, get_function_ref
+
+pytestmark = pytest.mark.usefixtures("fake_ack_scripts")
 
 Q = "default"
 
@@ -118,10 +120,7 @@ def _fake_requeue(monkeypatch, fail_first=False):
         calls["n"] += 1
         if fail_first and calls["n"] == 1:
             raise RedisConnectionError("down")
-        n = await redis.lrem(get_redis_q_backup_key(q, wid), 1, value)
-        if n:
-            await redis.rpush(get_redis_q_key(q), value)
-        return n
+        return await fake_requeue(redis, q, wid, value)
 
     monkeypatch.setattr("async_q.async_worker.scripts.requeue", requeue)
     return calls

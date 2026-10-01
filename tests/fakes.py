@@ -1,5 +1,9 @@
 import asyncio
 
+from async_q.utils import (
+    get_dead_letter_key, get_redis_q_backup_key, get_redis_q_key, get_retry_zset_key,
+)
+
 
 class FakeAsyncRedis:
     def __init__(self):
@@ -133,3 +137,21 @@ class NoopLogger:
 
     def error(self, *a, **k):
         pass
+
+
+# Lua stand-ins with the same LREM-guarded semantics (FakeAsyncRedis has no eval).
+async def fake_requeue(redis, q, wid, value):
+    n = await redis.lrem(get_redis_q_backup_key(q, wid), 1, value)
+    if n:
+        await redis.rpush(get_redis_q_key(q), value)
+    return n
+
+
+async def fake_fail_ack(redis, q, wid, original, new_payload, mode, score=0):
+    n = await redis.lrem(get_redis_q_backup_key(q, wid), 1, original)
+    if n:
+        if mode == 'retry':
+            await redis.zadd(get_retry_zset_key(q), {new_payload: score})
+        else:
+            await redis.lpush(get_dead_letter_key(q), new_payload)
+    return n

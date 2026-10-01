@@ -5,6 +5,8 @@ import pytest
 from fakes import FakeAsyncRedis, FakeTask, NoopLogger
 from async_q.utils import TaskMetaData, QueueItem, serialize
 
+pytestmark = pytest.mark.usefixtures("fake_ack_scripts")
+
 
 @pytest.mark.asyncio
 async def test_failing_task_reaches_dlq_after_max_retries():

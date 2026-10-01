@@ -7,6 +7,8 @@ from async_q.utils import (
     TaskMetaData, deserialize, serialize, get_function_ref, get_task_key,
 )
 
+pytestmark = pytest.mark.usefixtures("fake_ack_scripts")
+
 Q = "default"
 
 

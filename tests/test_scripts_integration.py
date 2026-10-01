@@ -5,7 +5,7 @@ import pytest
 from async_q import scripts
 from async_q.utils import (
     get_redis_q_key, get_redis_q_backup_key, get_retry_zset_key,
-    get_heartbeat_key, get_workers_key,
+    get_heartbeat_key, get_workers_key, get_dead_letter_key,
 )
 
 Q = "itest"
@@ -76,3 +76,39 @@ async def test_requeue_moves_to_front_and_is_idempotent(real_redis):
     assert await real_redis.lrange(get_redis_q_key(Q), 0, -1) == [b"queued", b"p1"]
     assert await scripts.requeue(real_redis, Q, "w1", b"p1") == 0
     assert await real_redis.lrange(get_redis_q_key(Q), 0, -1) == [b"queued", b"p1"]
+
+
+@pytest.mark.asyncio
+async def test_fail_ack_retry_mode_moves_backup_to_retry(real_redis):
+    await real_redis.lpush(get_redis_q_backup_key(Q, "w1"), b"orig")
+    assert await scripts.fail_ack(real_redis, Q, "w1", b"orig", b"bumped", "retry", 123.5) == 1
+    assert await real_redis.lrange(get_redis_q_backup_key(Q, "w1"), 0, -1) == []
+    assert await real_redis.zrange(get_retry_zset_key(Q), 0, -1, withscores=True) == [(b"bumped", 123.5)]
+    assert not await real_redis.exists(get_dead_letter_key(Q))
+
+
+@pytest.mark.asyncio
+async def test_fail_ack_dead_mode_moves_backup_to_dlq(real_redis):
+    await real_redis.lpush(get_redis_q_backup_key(Q, "w1"), b"orig")
+    assert await scripts.fail_ack(real_redis, Q, "w1", b"orig", b"final", "dead") == 1
+    assert await real_redis.lrange(get_redis_q_backup_key(Q, "w1"), 0, -1) == []
+    assert await real_redis.lrange(get_dead_letter_key(Q), 0, -1) == [b"final"]
+    assert not await real_redis.exists(get_retry_zset_key(Q))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["retry", "dead"])
+async def test_fail_ack_not_in_backup_writes_nothing(real_redis, mode):
+    await real_redis.lpush(get_redis_q_backup_key(Q, "w1"), b"other")
+    assert await scripts.fail_ack(real_redis, Q, "w1", b"orig", b"new", mode, 1) == 0
+    assert await real_redis.lrange(get_redis_q_backup_key(Q, "w1"), 0, -1) == [b"other"]
+    assert not await real_redis.exists(get_retry_zset_key(Q))
+    assert not await real_redis.exists(get_dead_letter_key(Q))
+
+
+@pytest.mark.asyncio
+async def test_fail_ack_rejects_unknown_mode(real_redis):
+    await real_redis.lpush(get_redis_q_backup_key(Q, "w1"), b"orig")
+    with pytest.raises(ValueError):
+        await scripts.fail_ack(real_redis, Q, "w1", b"orig", b"new", "bogus")
+    assert await real_redis.lrange(get_redis_q_backup_key(Q, "w1"), 0, -1) == [b"orig"]

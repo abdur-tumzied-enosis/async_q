@@ -13,7 +13,7 @@ Q = "default"
 
 
 @pytest.fixture
-def no_lua(monkeypatch):
+def no_lua(monkeypatch, fake_ack_scripts):
     """FakeAsyncRedis can't run Lua: record script calls instead."""
     calls = []
 
@@ -31,12 +31,6 @@ def no_lua(monkeypatch):
             await redis.lpush(aw.get_redis_q_key(q), backup.pop())
         return 0
 
-    async def requeue(redis, q, wid, value):
-        await redis.lrem(aw.get_redis_q_backup_key(q, wid), 1, value)
-        await redis.rpush(aw.get_redis_q_key(q), value)
-        return 1
-
-    monkeypatch.setattr(aw.scripts, "requeue", requeue)
     monkeypatch.setattr(aw.scripts, "reclaim", reclaim)
     monkeypatch.setattr(aw.scripts, "promote_due", promote_due)
     monkeypatch.setattr(aw.scripts, "release", release)

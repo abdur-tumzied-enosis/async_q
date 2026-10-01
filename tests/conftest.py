@@ -21,6 +21,15 @@ def reset_async_task_queue():
     aq.AsyncTaskQueue._instance = None
 
 
+@pytest.fixture
+def fake_ack_scripts(monkeypatch):
+    """Swap the ack scripts for FakeAsyncRedis-compatible stand-ins."""
+    from async_q import scripts
+    from fakes import fake_fail_ack, fake_requeue
+    monkeypatch.setattr(scripts, "requeue", fake_requeue)
+    monkeypatch.setattr(scripts, "fail_ack", fake_fail_ack)
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     # Create a fresh event loop for the test session

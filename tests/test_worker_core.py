@@ -2,10 +2,14 @@ import asyncio
 import time
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 
+from async_q import scripts
 from fakes import FakeAsyncRedis, FakeTask, NoopLogger
 from async_q.async_worker import Worker
 from async_q.utils import QueueItem, TaskMetaData, deserialize, serialize, get_task_key, get_function_ref
+
+pytestmark = pytest.mark.usefixtures("fake_ack_scripts")
 
 Q = "default"
 
@@ -119,3 +123,58 @@ async def test_task_done_releases_concurrency_slot():
     await w.redis.lpush(w.backup_key, payload)
     await w.task_done(FakeTask(result=item), item)
     assert not w.sem.locked()
+
+
+def _broken(monkeypatch, name):
+    async def boom(*a, **k):
+        raise RedisConnectionError("down")
+    monkeypatch.setattr(scripts, name, boom)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [0, 2])  # retry path, DLQ path
+async def test_failure_ack_error_keeps_payload_in_backup(monkeypatch, attempt):
+    _broken(monkeypatch, "fail_ack")
+    w = _worker()
+    item, payload = _item(_meta(attempt=attempt, max_retries=2))
+    await w.redis.lpush(w.backup_key, payload)
+    with pytest.raises(RedisConnectionError):
+        await w.task_done(FakeTask(exc=RuntimeError("boom")), item)
+    assert w.redis.lists[w.backup_key] == [payload]  # peers can still reclaim it
+
+
+@pytest.mark.asyncio
+async def test_cancel_requeue_error_keeps_payload_in_backup(monkeypatch):
+    _broken(monkeypatch, "requeue")
+    w = _worker()
+    item, payload = _item(_meta())
+    await w.redis.lpush(w.backup_key, payload)
+    with pytest.raises(RedisConnectionError):
+        await w.task_done(FakeTask(exc=asyncio.CancelledError()), item)
+    assert w.redis.lists[w.backup_key] == [payload]
+
+
+@pytest.mark.asyncio
+async def test_reject_error_keeps_payload_in_backup(monkeypatch):
+    _broken(monkeypatch, "fail_ack")
+    w = _worker()
+    await w.redis.lpush(w.backup_key, b"\xc1garbage")
+    with pytest.raises(RedisConnectionError):
+        await w.process_message(b"\xc1garbage")
+    assert w.redis.lists[w.backup_key] == [b"\xc1garbage"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_after_reclaim_does_not_overwrite_status():
+    w = _worker()
+    item, _ = _item(_meta())
+    await w.task_done(FakeTask(exc=asyncio.CancelledError()), item)
+    assert get_task_key("t1") not in w.redis.kv  # a peer owns it now
+
+
+@pytest.mark.asyncio
+async def test_failed_after_reclaim_does_not_overwrite_status():
+    w = _worker()
+    item, _ = _item(_meta(max_retries=5))
+    await w.task_done(FakeTask(exc=RuntimeError("boom")), item)
+    assert get_task_key("t1") not in w.redis.kv

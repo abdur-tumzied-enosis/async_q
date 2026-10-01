@@ -84,9 +84,7 @@ class Worker:
     async def reject(self, value, reason: str, meta: Optional[TaskMetaData] = None) -> None:
         """Move an unprocessable payload from backup to the DLQ so it can't crash the worker again."""
         self.logger.error('rejecting task to DLQ: %s', reason)
-        await self.redis.lrem(self.backup_key, 1, value)
-        await self.redis.lpush(self.dead_key, value)
-        if meta is not None:
+        if await scripts.fail_ack(self.redis, self.q, self.wid, value, value, 'dead') and meta is not None:
             await self.set_status(meta, 'failed')
 
     async def process_message(self, value) -> Optional[QueueItem]:
@@ -126,40 +124,41 @@ class Worker:
                 task.result()
             except asyncio.CancelledError:
                 # Front of the queue: it was already running, re-run it first.
-                if await self.redis.lrem(self.backup_key, 1, item.original_data):
-                    await self.redis.rpush(self.main_key, item.original_data)
-                await self.set_status(meta, 'submitted')
-                self.logger.info('task %s cancelled; re-queued', meta.id)
+                if await scripts.requeue(self.redis, self.q, self.wid, item.original_data):
+                    await self.set_status(meta, 'submitted')
+                    self.logger.info('task %s cancelled; re-queued', meta.id)
+                else:
+                    self._warn_reclaimed(meta)
                 return
             except Exception as e:
                 self.logger.error('task %s failed: %r', meta.id, e)
                 self.logger.debug('traceback', exc_info=e)
-                if not await self._ack(item, meta):
-                    return
-                if meta.attempt < meta.max_retries:
+                retry = meta.attempt < meta.max_retries
+                if retry:
                     meta.attempt += 1
                     delay = min(meta.backoff_base * (meta.backoff_factor ** (meta.attempt - 1)), meta.backoff_max)
                     meta.next_retry_at = time.time() + delay
-                    await self.set_status(meta, 'failed')
-                    # Re-serialize so the bumped attempt count travels with the payload
-                    await self.redis.zadd(self.retry_key, {serialize(meta): meta.next_retry_at})
+                meta.status = 'failed'
+                # Re-serialize so the bumped attempt count travels with the payload
+                if not await scripts.fail_ack(self.redis, self.q, self.wid, item.original_data, serialize(meta),
+                                              'retry' if retry else 'dead', meta.next_retry_at if retry else 0):
+                    self._warn_reclaimed(meta)
+                    return
+                await self.set_status(meta, 'failed')
+                if retry:
                     self.logger.info('scheduled retry #%s in %.2fs for %s', meta.attempt, delay, meta.id)
                 else:
-                    await self.set_status(meta, 'failed')
-                    await self.redis.lpush(self.dead_key, serialize(meta))
                     self.logger.warning('moved task %s to DLQ after %s attempts', meta.id, meta.attempt)
                 return
-            if await self._ack(item, meta):
+            if await self.redis.lrem(self.backup_key, 1, item.original_data):
                 await self.set_status(meta, 'finished')
+            else:
+                self._warn_reclaimed(meta)
         finally:
             self.sem.release()
 
-    async def _ack(self, item: QueueItem, meta: TaskMetaData) -> bool:
-        """Remove from own backup. False means a peer reclaimed it (task may run twice)."""
-        if await self.redis.lrem(self.backup_key, 1, item.original_data):
-            return True
+    def _warn_reclaimed(self, meta: TaskMetaData) -> None:
         self.logger.warning('task %s was reclaimed by another worker while running; it may run twice', meta.id)
-        return False
 
     async def fetch_loop(self) -> None:
         """Pull work only when a concurrency slot is free. Runs until cancelled."""

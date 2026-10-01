@@ -4,6 +4,7 @@ Every key a script touches belongs to one queue and carries the same {q} hash
 tag, so each script runs in a single Redis Cluster slot.
 """
 from .utils import (
+    get_dead_letter_key,
     get_heartbeat_key,
     get_redis_q_backup_key,
     get_redis_q_key,
@@ -46,6 +47,19 @@ if n == 1 then redis.call('RPUSH', KEYS[2], ARGV[1]) end
 return n
 """
 
+# KEYS: backup, retry, dead  ARGV: original, new_payload, score, mode
+_FAIL_ACK = """
+local n = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if n == 1 then
+  if ARGV[4] == 'retry' then
+    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
+  else
+    redis.call('LPUSH', KEYS[3], ARGV[2])
+  end
+end
+return n
+"""
+
 
 async def reclaim(redis, q: str, wid: str) -> int:
     """Return a dead worker's in-flight payloads to the main queue; -1 if it is alive."""
@@ -73,3 +87,16 @@ async def release(redis, q: str, wid: str) -> int:
 async def requeue(redis, q: str, wid: str, value) -> int:
     """Atomically move one payload from a worker's backup to the front of main; 0 if it was not there."""
     return await redis.eval(_REQUEUE, 2, get_redis_q_backup_key(q, wid), get_redis_q_key(q), value)
+
+
+
+async def fail_ack(redis, q: str, wid: str, original, new_payload, mode: str, score: float = 0) -> int:
+    """Atomically move a failed payload from a worker's backup to retry (mode 'retry', at score)
+    or the DLQ (mode 'dead'); 0 if it was not there (a peer reclaimed it) and nothing is written."""
+    if mode not in ('retry', 'dead'):
+        raise ValueError(f'unknown fail_ack mode: {mode!r}')
+    return await redis.eval(
+        _FAIL_ACK, 3,
+        get_redis_q_backup_key(q, wid), get_retry_zset_key(q), get_dead_letter_key(q),
+        original, new_payload, score, mode,
+    )
