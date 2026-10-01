@@ -130,6 +130,40 @@ async def create_async_task_from_queue(distribute_qname: str, redis: aioredis.Re
         task.add_done_callback(lambda t, _item=item: task_done_callback(t, queue, distribute_qname, redis, logger, _item))
 
 
+async def _reject(value, distribute_qname: str, redis: aioredis.Redis, logger, reason: str, meta: Optional[TaskMetaData] = None):
+    """Move an unprocessable payload from backup to the DLQ so it can't crash the worker again."""
+    logger.error('rejecting task to DLQ: %s', reason)
+    await redis.lrem(get_redis_q_backup_key(distribute_qname), count=1, value=value)
+    await redis.lpush(get_dead_letter_key(distribute_qname), value)
+    if meta is not None:
+        meta.status = 'failed'
+        await redis.set(get_task_key(meta.id), serialize(meta))
+
+
+async def _process_message(value, distribute_qname: str, redis: aioredis.Redis, queue: asyncio.Queue, logger):
+    try:
+        data = deserialize(value)
+    except Exception as e:
+        await _reject(value, distribute_qname, redis, logger, f'undecodable payload: {e!r}')
+        return
+
+    logger.debug("deserialize received value : %s", data)
+
+    try:
+        fun = await to_thread(get_function_ref, data.path, data.func_name)
+    except Exception as e:
+        await _reject(value, distribute_qname, redis, logger, f'cannot load {data.path}:{data.func_name}: {e!r}', data)
+        return
+
+    if not inspect.iscoroutinefunction(fun):
+        await _reject(value, distribute_qname, redis, logger, f'{data.func_name} is not a coroutine function', data)
+        return
+
+    data.status = 'pending'
+    await redis.set(get_task_key(data.id), serialize(data))
+    await queue.put(QueueItem(func_ref=fun, deserialize_data=data, original_data=value))
+
+
 async def listen_to_submitted_task(distribute_qname: str, redis: aioredis.Redis, queue: AsyncQueue, logger, stop_event: asyncio.Event):
 
     # get the unfinished task form the backup queue
@@ -162,26 +196,7 @@ async def listen_to_submitted_task(distribute_qname: str, redis: aioredis.Redis,
                 pass
             continue
 
-        data = deserialize(value)
-
-        if not isinstance(data, TaskMetaData):
-            assert 1 == await redis.lrem(get_redis_q_backup_key(distribute_qname), count=1, value=value), "can not remove invalid data from q backup"
-            logging.error("submitted task is not dict type")
-
-        logger.debug("deserialize received value : %s", data)
-
-        fun = await to_thread(get_function_ref, data.path, data.func_name)
-        logger.debug('get function ref %s', str(fun))
-
-        if fun and inspect.iscoroutinefunction(fun):
-            data.status = 'pending'
-            await redis.set(get_task_key(data.id), serialize(data))
-            await queue.put(QueueItem(func_ref=fun, deserialize_data=data, original_data=value))
-        else:
-            logger.info('submitted function is not coroutine')
-            logger.debug('skipped from creating task')
-
-            await redis.lrem(get_redis_q_backup_key(distribute_qname), count=1, value=value)
+        await _process_message(value, distribute_qname, redis, queue, logger)
 
 
 async def async_worker(stop_event: Optional[asyncio.Event] = None):
