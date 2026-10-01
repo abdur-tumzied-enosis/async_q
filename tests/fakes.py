@@ -1,8 +1,13 @@
+import asyncio
+
+
 class FakeAsyncRedis:
     def __init__(self):
         self.lists = {}
         self.kv = {}
         self.zsets = {}
+        self.sets = {}
+        self.ttl = {}
 
     # list ops
     async def lpush(self, key, value):
@@ -40,9 +45,46 @@ class FakeAsyncRedis:
         return val
 
     # kv ops
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, px=None):
         self.kv[key] = value
+        self.ttl[key] = ex if ex is not None else (px / 1000 if px is not None else None)
         return True
+
+    async def exists(self, key):
+        return int(key in self.kv or bool(self.lists.get(key)) or bool(self.sets.get(key)))
+
+    async def delete(self, key):
+        self.kv.pop(key, None)
+        self.lists.pop(key, None)
+        self.sets.pop(key, None)
+
+    async def rpush(self, key, value):
+        self.lists.setdefault(key, []).append(value)
+        return len(self.lists[key])
+
+    async def rpop(self, key):
+        lst = self.lists.get(key, [])
+        return lst.pop() if lst else None
+
+    async def brpoplpush(self, src, dst, timeout=0):
+        val = await self.rpoplpush(src, dst)
+        if val is None:
+            await asyncio.sleep(0.01)  # ponytail: don't really block; just yield
+        return val
+
+    async def sadd(self, key, member):
+        self.sets.setdefault(key, set()).add(member)
+
+    async def srem(self, key, member):
+        self.sets.get(key, set()).discard(member)
+
+    async def smembers(self, key):
+        return {m.encode() if isinstance(m, str) else m for m in self.sets.get(key, set())}
+
+    async def zrange(self, key, start, end, withscores=False):
+        items = sorted(self.zsets.get(key, {}).items(), key=lambda x: x[1])
+        items = items[start:] if end == -1 else items[start:end + 1]
+        return items if withscores else [m for m, _ in items]
 
     # zset ops
     async def zadd(self, key, mapping):

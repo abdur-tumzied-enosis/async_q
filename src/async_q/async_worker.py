@@ -4,6 +4,7 @@ import logging
 import re
 import traceback
 import copy
+import time
 from typing import Any, Dict, Optional
 
 import redis.asyncio as aioredis
@@ -21,6 +22,9 @@ from .utils import (
     to_thread,
     get_retry_zset_key,
     get_dead_letter_key,
+    get_heartbeat_key,
+    get_workers_key,
+    new_worker_id,
 )
 
 
@@ -263,3 +267,113 @@ async def async_worker(stop_event: Optional[asyncio.Event] = None):
             pass
 
         await r.close()
+
+
+class Worker:
+    """One worker process on one queue. Construct inside a running event loop."""
+
+    def __init__(self, redis, queue_name: str, concurrency: int, logger, *,
+                 status_ttl: int = 86400, heartbeat_interval: float = 10.0,
+                 heartbeat_ttl: float = 30.0, shutdown_timeout: float = 30.0,
+                 wid: Optional[str] = None):
+        self.redis = redis
+        self.q = queue_name
+        self.logger = logger
+        self.status_ttl = status_ttl
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_ttl = heartbeat_ttl
+        self.shutdown_timeout = shutdown_timeout
+        self.wid = wid or new_worker_id()
+        self.main_key = get_redis_q_key(queue_name)
+        self.backup_key = get_redis_q_backup_key(queue_name, self.wid)
+        self.hb_key = get_heartbeat_key(queue_name, self.wid)
+        self.workers_key = get_workers_key(queue_name)
+        self.retry_key = get_retry_zset_key(queue_name)
+        self.dead_key = get_dead_letter_key(queue_name)
+        self.sem = asyncio.Semaphore(concurrency)
+        self.inflight: set = set()
+        self.background: set = set()  # strong refs: done-handlers must not be GC'd mid-flight
+
+    async def set_status(self, meta: TaskMetaData, status: str) -> None:
+        meta.status = status
+        await self.redis.set(get_task_key(meta.id), serialize(meta), ex=self.status_ttl)
+
+    async def reject(self, value, reason: str, meta: Optional[TaskMetaData] = None) -> None:
+        """Move an unprocessable payload from backup to the DLQ so it can't crash the worker again."""
+        self.logger.error('rejecting task to DLQ: %s', reason)
+        await self.redis.lrem(self.backup_key, 1, value)
+        await self.redis.lpush(self.dead_key, value)
+        if meta is not None:
+            await self.set_status(meta, 'failed')
+
+    async def process_message(self, value) -> Optional[QueueItem]:
+        try:
+            data = deserialize(value)
+        except Exception as e:
+            await self.reject(value, f'undecodable payload: {e!r}')
+            return None
+
+        self.logger.debug("deserialize received value : %s", data)
+
+        try:
+            fun = await to_thread(get_function_ref, data.path, data.func_name)
+        except Exception as e:
+            await self.reject(value, f'cannot load {data.path}:{data.func_name}: {e!r}', data)
+            return None
+
+        if not inspect.iscoroutinefunction(fun):
+            await self.reject(value, f'{data.func_name} is not a coroutine function', data)
+            return None
+
+        await self.set_status(data, 'pending')
+        return QueueItem(func_ref=fun, deserialize_data=data, original_data=value)
+
+    async def run_task(self, item: QueueItem) -> QueueItem:
+        meta = copy.deepcopy(item.deserialize_data)
+        await self.set_status(meta, 'starting')
+        tkey = get_task_key(meta.id)
+        self.logger.debug('starting a new task; task_id: %s', tkey)
+        await item.func_ref(*meta.args, **{**meta.kwargs, 'task_id': tkey})
+        return item
+
+    async def task_done(self, task, item: QueueItem) -> None:
+        meta = copy.deepcopy(item.deserialize_data)
+        try:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                # Front of the queue: it was already running, re-run it first.
+                if await self.redis.lrem(self.backup_key, 1, item.original_data):
+                    await self.redis.rpush(self.main_key, item.original_data)
+                await self.set_status(meta, 'submitted')
+                self.logger.info('task %s cancelled; re-queued', meta.id)
+                return
+            except Exception as e:
+                self.logger.error('task %s failed: %r', meta.id, e)
+                self.logger.debug('traceback', exc_info=e)
+                if not await self._ack(item, meta):
+                    return
+                if meta.attempt < meta.max_retries:
+                    meta.attempt += 1
+                    delay = min(meta.backoff_base * (meta.backoff_factor ** (meta.attempt - 1)), meta.backoff_max)
+                    meta.next_retry_at = time.time() + delay
+                    await self.set_status(meta, 'failed')
+                    # Re-serialize so the bumped attempt count travels with the payload
+                    await self.redis.zadd(self.retry_key, {serialize(meta): meta.next_retry_at})
+                    self.logger.info('scheduled retry #%s in %.2fs for %s', meta.attempt, delay, meta.id)
+                else:
+                    await self.set_status(meta, 'failed')
+                    await self.redis.lpush(self.dead_key, serialize(meta))
+                    self.logger.warning('moved task %s to DLQ after %s attempts', meta.id, meta.attempt)
+                return
+            if await self._ack(item, meta):
+                await self.set_status(meta, 'finished')
+        finally:
+            self.sem.release()
+
+    async def _ack(self, item: QueueItem, meta: TaskMetaData) -> bool:
+        """Remove from own backup. False means a peer reclaimed it (task may run twice)."""
+        if await self.redis.lrem(self.backup_key, 1, item.original_data):
+            return True
+        self.logger.warning('task %s was reclaimed by another worker while running; it may run twice', meta.id)
+        return False

@@ -28,7 +28,7 @@ Found in Batch 1 review (deferred):
 - [ ] **B1 — Multiple workers on one queue re-run each other's tasks.** Backup list is shared; startup (`listen_to_submitted_task`) and shutdown (`async_worker` finally) move the *whole* backup list back to main. Fix: per-worker backup key + heartbeat/reclaim of dead workers' backups.
 - [ ] **B5 — Retries starve under load; non-atomic retry promotion.** Retry ZSET only polled when `brpoplpush` times out. `zrangebyscore`+`zrem`+`lpush` races between workers. Fix: poll on a timer; only `lpush` if `zrem` returned 1 (or Lua script).
 - [ ] **B6 — Shutdown doesn't drain in-flight tasks.** Backup is requeued while tasks still run (duplicates); `r.close()` races done-callbacks. Fix: track in-flight tasks, `gather` with timeout, then requeue + close.
-- [ ] **B10 — Status keys leak.** Only `finished` gets a TTL; `starting`, `failed`, DLQ statuses never expire. Fix: TTL on every status write (configurable).
+- [x] **B10 — Status keys leak.** Only `finished` gets a TTL; `starting`, `failed`, DLQ statuses never expire. Fix: TTL on every status write (configurable).
 
 ## Design / security
 
