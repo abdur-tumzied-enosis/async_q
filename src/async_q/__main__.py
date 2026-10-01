@@ -64,6 +64,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument('-lf', '--log_filename', default=None, type=str,
                         required=False,
                         help='set log file path `-lf ./logs/async-q.log`')
+    parser.add_argument('--shutdown-timeout', default=None, type=float,
+                        help='seconds to let running tasks finish on shutdown before re-queueing them (default 30)')
 
     args = parser.parse_args(argv)
 
@@ -81,6 +83,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     async_task_queue.distribute_qname = args.queue
 
+    if args.shutdown_timeout is not None:
+        async_task_queue.shutdown_timeout = args.shutdown_timeout
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -93,13 +98,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                 async_task_queue.logger.info('shutdown signal received; stopping...')
                 stop_event.set()
 
-        # Register signal handlers (Windows supports CTRL_C_EVENT → KeyboardInterrupt, but keep for POSIX)
         try:
             loop.add_signal_handler(signal.SIGINT, _request_shutdown)
             loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
         except NotImplementedError:
-            # Fallback for platforms without signal handler support in event loop
-            pass
+            # Windows: no loop signal handlers. Route Ctrl+C / Ctrl+Break to the same graceful path.
+            for sig in (signal.SIGINT, getattr(signal, 'SIGBREAK', None)):
+                if sig is not None:
+                    signal.signal(sig, lambda *_: loop.call_soon_threadsafe(_request_shutdown))
 
         loop.run_until_complete(
             async_worker(stop_event=stop_event)
