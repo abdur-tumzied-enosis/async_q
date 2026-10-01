@@ -39,6 +39,13 @@ redis.call('SREM', KEYS[4], ARGV[1])
 return n
 """
 
+# KEYS: backup, main  ARGV: value
+_REQUEUE = """
+local n = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if n == 1 then redis.call('RPUSH', KEYS[2], ARGV[1]) end
+return n
+"""
+
 
 async def reclaim(redis, q: str, wid: str) -> int:
     """Return a dead worker's in-flight payloads to the main queue; -1 if it is alive."""
@@ -61,3 +68,8 @@ async def release(redis, q: str, wid: str) -> int:
         get_redis_q_backup_key(q, wid), get_redis_q_key(q), get_heartbeat_key(q, wid), get_workers_key(q),
         wid,
     )
+
+
+async def requeue(redis, q: str, wid: str, value) -> int:
+    """Atomically move one payload from a worker's backup to the front of main; 0 if it was not there."""
+    return await redis.eval(_REQUEUE, 2, get_redis_q_backup_key(q, wid), get_redis_q_key(q), value)

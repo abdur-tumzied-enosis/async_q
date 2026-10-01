@@ -5,7 +5,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 from fakes import FakeAsyncRedis, NoopLogger
 from async_q.async_worker import Worker, _next_backoff
-from async_q.utils import TaskMetaData, serialize, get_function_ref
+from async_q.utils import TaskMetaData, serialize, get_function_ref, get_redis_q_key, get_redis_q_backup_key
 
 Q = "default"
 
@@ -111,16 +111,31 @@ async def test_inflight_tracks_running_tasks(tmp_path):
     await asyncio.gather(loop_task, return_exceptions=True)
 
 
-@pytest.mark.asyncio
-async def test_payload_returned_to_main_after_post_fetch_redis_error(tmp_path):
+def _fake_requeue(monkeypatch, fail_first=False):
+    calls = {"n": 0}
+
+    async def requeue(redis, q, wid, value):
+        calls["n"] += 1
+        if fail_first and calls["n"] == 1:
+            raise RedisConnectionError("down")
+        n = await redis.lrem(get_redis_q_backup_key(q, wid), 1, value)
+        if n:
+            await redis.rpush(get_redis_q_key(q), value)
+        return n
+
+    monkeypatch.setattr("async_q.async_worker.scripts.requeue", requeue)
+    return calls
+
+
+async def _stranded_run(tmp_path):
     path = _module(tmp_path, "ran = []\nasync def job(task_id=None):\n    ran.append(1)\n")
     redis = FakeAsyncRedis()
     real_set = redis.set
-    calls = {"n": 0}
+    sets = {"n": 0}
 
     async def flaky_set(*a, **kw):
-        calls["n"] += 1
-        if calls["n"] == 1:
+        sets["n"] += 1
+        if sets["n"] == 1:
             raise RedisConnectionError("down")
         return await real_set(*a, **kw)
 
@@ -129,8 +144,27 @@ async def test_payload_returned_to_main_after_post_fetch_redis_error(tmp_path):
     await redis.lpush(w.main_key, _payload(path, "ok"))
     loop_task = asyncio.create_task(w.fetch_loop())
     jobs = get_function_ref(path, "job").__globals__
+    return w, redis, loop_task, jobs
+
+
+@pytest.mark.asyncio
+async def test_payload_returned_to_main_after_post_fetch_redis_error(tmp_path, monkeypatch):
+    calls = _fake_requeue(monkeypatch)
+    w, redis, loop_task, jobs = await _stranded_run(tmp_path)
     assert await _until(lambda: jobs["ran"] == [1], timeout=3.0)
     assert await _until(lambda: redis.lists[w.backup_key] == [])
+    assert calls["n"] == 1
+    loop_task.cancel()
+    await asyncio.gather(loop_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_requeue_failure_is_retried(tmp_path, monkeypatch):
+    calls = _fake_requeue(monkeypatch, fail_first=True)
+    w, redis, loop_task, jobs = await _stranded_run(tmp_path)
+    assert await _until(lambda: jobs["ran"] == [1], timeout=6.0)
+    assert await _until(lambda: redis.lists[w.backup_key] == [])
+    assert calls["n"] == 2
     loop_task.cancel()
     await asyncio.gather(loop_task, return_exceptions=True)
 

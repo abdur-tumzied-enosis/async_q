@@ -66,3 +66,13 @@ async def test_release_returns_backup_and_unregisters(real_redis):
     assert await real_redis.lrange(get_redis_q_key(Q), 0, -1) == [b"p1"]
     assert not await real_redis.exists(get_heartbeat_key(Q, "w1"))
     assert await real_redis.smembers(get_workers_key(Q)) == {b"w2"}
+
+
+@pytest.mark.asyncio
+async def test_requeue_moves_to_front_and_is_idempotent(real_redis):
+    await real_redis.lpush(get_redis_q_key(Q), b"queued")
+    await real_redis.lpush(get_redis_q_backup_key(Q, "w1"), b"p1")
+    assert await scripts.requeue(real_redis, Q, "w1", b"p1") == 1
+    assert await real_redis.lrange(get_redis_q_key(Q), 0, -1) == [b"queued", b"p1"]
+    assert await scripts.requeue(real_redis, Q, "w1", b"p1") == 0
+    assert await real_redis.lrange(get_redis_q_key(Q), 0, -1) == [b"queued", b"p1"]

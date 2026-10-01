@@ -6,6 +6,7 @@ from typing import Optional
 
 from redis.exceptions import RedisError
 
+from . import scripts
 from .async_q import AsyncTaskQueue
 from .utils import (
     QueueItem,
@@ -163,8 +164,7 @@ class Worker:
                     # Best effort: hand the stranded payload back to main. If the reply was lost
                     # after the server already moved it, it stays in backup until release() at shutdown.
                     try:
-                        if await self.redis.lrem(self.backup_key, 1, fetched):
-                            await self.redis.rpush(self.main_key, fetched)
+                        await scripts.requeue(self.redis, self.q, self.wid, fetched)
                         fetched = None
                     except RedisError:
                         await asyncio.sleep(backoff)
