@@ -178,3 +178,51 @@ async def test_failed_after_reclaim_does_not_overwrite_status():
     item, _ = _item(_meta(max_retries=5))
     await w.task_done(FakeTask(exc=RuntimeError("boom")), item)
     assert get_task_key("t1") not in w.redis.kv
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["success", "failure", "cancel"])
+async def test_refetched_own_reclaimed_payload_acks_only_last_copy(first):
+    # A peer reclaimed our backup during an outage and we fetched the same bytes again:
+    # two in-flight copies, one backup entry. Only the last copy may ack it.
+    futs = []
+
+    async def job(task_id=None):
+        fut = asyncio.get_running_loop().create_future()
+        futs.append(fut)
+        await fut
+
+    w = _worker()
+    meta = _meta(max_retries=3)
+    payload = serialize(meta)
+    await w.redis.lpush(w.backup_key, payload)
+    copies = [QueueItem(func_ref=job, deserialize_data=meta, original_data=payload) for _ in range(2)]
+    for item in copies:
+        await w.sem.acquire()
+        w.start_task(item)
+    assert await _until(lambda: len(futs) == 2)
+
+    if first == "success":
+        futs[0].set_result(None)
+    elif first == "failure":
+        futs[0].set_exception(RuntimeError("boom"))
+    else:
+        futs[0].cancel()
+    assert await _until(lambda: len(w.inflight) == 1 and not w.background)
+    assert w.redis.lists[w.backup_key] == [payload]       # still owned by the running copy
+    assert w.retry_key not in w.redis.zsets and w.redis.lists.get(w.main_key, []) == []
+
+    futs[1].set_result(None)
+    assert await _until(lambda: not w.inflight and not w.background)
+    assert w.redis.lists[w.backup_key] == []
+    assert deserialize(w.redis.kv[get_task_key("t1")]).status == "finished"
+    assert not w.sem.locked() and w.sem._value == 2      # both slots released
+    assert not w.copies
+
+
+async def _until(pred, timeout=2.0):
+    for _ in range(int(timeout / 0.01)):
+        if pred():
+            return True
+        await asyncio.sleep(0.01)
+    return False

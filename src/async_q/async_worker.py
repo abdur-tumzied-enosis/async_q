@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import inspect
 import copy
 import time
@@ -75,6 +76,9 @@ class Worker:
         self.dead_key = get_dead_letter_key(queue_name)
         self.sem = asyncio.Semaphore(concurrency)
         self.inflight: set = set()
+        # In-flight copies per payload. >1 means peers reclaimed our backup during an outage and we
+        # fetched the same bytes again: one backup entry, so only the last copy to finish may ack it.
+        self.copies: collections.Counter = collections.Counter()
         self.background: set = set()  # strong refs: done-handlers must not be GC'd mid-flight
 
     async def set_status(self, meta: TaskMetaData, status: str) -> None:
@@ -120,6 +124,10 @@ class Worker:
     async def task_done(self, task, item: QueueItem) -> None:
         meta = copy.deepcopy(item.deserialize_data)
         try:
+            if self._release_copy(item.original_data):
+                self.logger.warning('task %s: another in-flight copy of this payload (own task, reclaimed and '
+                                    're-fetched) still owns the backup entry; skipping ack', meta.id)
+                return
             try:
                 task.result()
             except asyncio.CancelledError:
@@ -156,6 +164,14 @@ class Worker:
                 self._warn_reclaimed(meta)
         finally:
             self.sem.release()
+
+    def _release_copy(self, value) -> bool:
+        """Drop one in-flight copy of value; True if another copy remains to ack the backup entry."""
+        if self.copies[value] > 1:
+            self.copies[value] -= 1
+            return True
+        self.copies.pop(value, None)
+        return False
 
     def _warn_reclaimed(self, meta: TaskMetaData) -> None:
         self.logger.warning('task %s was reclaimed by another worker while running; it may run twice', meta.id)
@@ -197,6 +213,7 @@ class Worker:
     def start_task(self, item: QueueItem) -> None:
         task = asyncio.create_task(self.run_task(item), name=get_task_key(item.deserialize_data.id))
         self.inflight.add(task)
+        self.copies[item.original_data] += 1
         task.add_done_callback(lambda t, _item=item: self._on_done(t, _item))
 
     def _on_done(self, task, item: QueueItem) -> None:
