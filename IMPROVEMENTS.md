@@ -13,7 +13,7 @@ Plan: [`docs/superpowers/plans/2026-10-01-quick-fixes.md`](docs/superpowers/plan
 - [x] **B8 — `async_worker` builds but never raises "not initiated" exception.** Fix: `raise RuntimeError`.
 - [x] **B2 — Retries unreachable from public API.** `submit_task` has no `max_retries` / `backoff_*` params. Fix: add them.
 - [x] **B7 — Fire-and-forget done-handler tasks may be GC'd.** `task_done_callback` drops the `create_task` reference. Fix: hold in a module-level set.
-- [ ] **B9 — CLI uses deprecated `asyncio.get_event_loop()`.** Fix: `main()` with `asyncio.new_event_loop()`, plus `async_q` console script.
+- [x] **B9 — CLI uses deprecated `asyncio.get_event_loop()`.** Fix: `main()` with `asyncio.new_event_loop()`, plus `async_q` console script.
 
 ## Batch 2 — multi-worker correctness
 

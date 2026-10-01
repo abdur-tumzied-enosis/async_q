@@ -91,6 +91,12 @@ In order to efficiently handle incoming tasks, it's crucial to set up and launch
 python -m async_q -a main_app.py:async_q_app -c 5
 ```
 
+Installing the package also provides an `async_q` command, equivalent to `python -m async_q`:
+
+```bash
+async_q -a main_app.py:async_q_app -c 5
+```
+
 - Dotted module path (portable across machines):
 
 ```bash
