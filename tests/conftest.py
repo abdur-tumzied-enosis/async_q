@@ -48,4 +48,4 @@ async def real_redis():
     await r.flushdb()
     yield r
     await r.flushdb()
-    await r.close()
+    await (getattr(r, "aclose", None) or r.close)()

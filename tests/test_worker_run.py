@@ -167,3 +167,30 @@ async def test_async_worker_runs_worker_from_app(monkeypatch, reset_async_task_q
     await aw.async_worker(asyncio.Event())
     assert seen == {"q": "mail", "ttl": 7, "timeout": 9}
     assert closed == {"yes": True}
+
+
+@pytest.mark.asyncio
+async def test_async_worker_prefers_aclose(monkeypatch, reset_async_task_queue):
+    from async_q.async_q import AsyncTaskQueue
+    calls = []
+
+    class FakeBuilder:
+        def get_redis_async(self):
+            r = FakeAsyncRedis()
+
+            async def aclose():
+                calls.append("aclose")
+
+            async def close():
+                calls.append("close")
+
+            r.aclose, r.close = aclose, close
+            return r
+
+    async def fake_run(self, stop_event):
+        pass
+
+    monkeypatch.setattr(Worker, "run", fake_run)
+    AsyncTaskQueue(redis_builder=FakeBuilder())
+    await aw.async_worker(asyncio.Event())
+    assert calls == ["aclose"]

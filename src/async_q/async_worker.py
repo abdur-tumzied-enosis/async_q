@@ -50,7 +50,7 @@ async def async_worker(stop_event: Optional[asyncio.Event] = None):
     try:
         await worker.run(stop_event)
     finally:
-        await r.close()
+        await (getattr(r, 'aclose', None) or r.close)()  # aclose: redis-py >=5.0.1
 
 
 class Worker:
